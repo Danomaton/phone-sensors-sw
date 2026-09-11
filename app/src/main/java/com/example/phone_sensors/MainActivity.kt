@@ -19,6 +19,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,12 +39,17 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.UsbManager
 import android.app.PendingIntent
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
 import android.os.Build
 import android.util.Log
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.ui.unit.TextUnit
 import com.example.phone_sensors.ui.theme.PhonesensorsTheme
-
+import kotlinx.coroutines.delay
+import java.util.Locale
+import kotlin.math.pow
 
 
 val darkGreen    = Color(0xFF0B3229)
@@ -130,6 +136,122 @@ fun BoxGrid(modifier: Modifier = Modifier) {
         }
     }
 
+    var altitude by remember { mutableStateOf(0.0f) }
+    var temperature by remember { mutableStateOf(0.0f) }
+    var humidity by remember { mutableStateOf(0.0f) }
+    var pressure by remember { mutableStateOf(0.0f) }
+    var airQuality by remember { mutableStateOf(0) }
+
+    val ms8607C = remember { LongArray(7) }
+    var isCalibrated by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isConnected) {
+        if (isConnected && usbManager != null) {
+            val devices = usbManager.deviceList.values
+            val ft260 = devices.find { it.productName?.contains("FT260", ignoreCase = true) == true }
+            ft260?.let { device ->
+                val connection = usbManager.openDevice(device)
+                if (connection != null) {
+                    val iface = device.getInterface(0)
+                    connection.claimInterface(iface, true)
+
+                    val endpoints = (0 until iface.endpointCount).map { iface.getEndpoint(it) }
+                    val epIn = endpoints.find { it.direction == UsbConstants.USB_DIR_IN }
+                    val epOut = endpoints.find { it.direction == UsbConstants.USB_DIR_OUT }
+
+                    if (epIn != null && epOut != null) {
+                        // 1. Initial Calibration (Read PROM)
+                        if (!isCalibrated) {
+                            try {
+                                writeI2C(connection, epOut, 0x76, byteArrayOf(0x1E.toByte()))
+                                delay(20)
+                                
+                                for (i in 0..6) {
+                                    writeI2C(connection, epOut, 0x76, byteArrayOf((0xA0 + i * 2).toByte()))
+                                    val res = readI2C(connection, epIn, epOut, 0x76, 2)
+                                    if (res != null) {
+                                        ms8607C[i] = ((res[0].toInt() and 0xFF).toLong() shl 8) or (res[1].toInt() and 0xFF).toLong()
+                                    }
+                                }
+                                isCalibrated = true
+                            } catch (e: Exception) {
+                                Log.e("FT260", "Calibration failed", e)
+                            }
+                        }
+
+                        // 2. Polling Loop
+                        while (isConnected) {
+                            try {
+                                // --- Pressure & Temperature (Address 0x76) ---
+                                
+                                // A. Convert Temperature (D2)
+                                writeI2C(connection, epOut, 0x76, byteArrayOf(0x58.toByte())) // OSR 4096
+                                delay(20)
+                                writeI2C(connection, epOut, 0x76, byteArrayOf(0x00.toByte()))
+                                val d2Data = readI2C(connection, epIn, epOut, 0x76, 3)
+                                
+                                // B. Convert Pressure (D1)
+                                writeI2C(connection, epOut, 0x76, byteArrayOf(0x48.toByte())) // OSR 4096
+                                delay(20)
+                                writeI2C(connection, epOut, 0x76, byteArrayOf(0x00.toByte()))
+                                val d1Data = readI2C(connection, epIn, epOut, 0x76, 3)
+
+                                if (d2Data != null && d1Data != null) {
+                                    val D2 = ((d2Data[0].toInt() and 0xFF).toLong() shl 16) or 
+                                             ((d2Data[1].toInt() and 0xFF).toLong() shl 8) or 
+                                             (d2Data[2].toInt() and 0xFF).toLong()
+                                    
+                                    val D1 = ((d1Data[0].toInt() and 0xFF).toLong() shl 16) or 
+                                             ((d1Data[1].toInt() and 0xFF).toLong() shl 8) or 
+                                             (d1Data[2].toInt() and 0xFF).toLong()
+
+                                    // 1. Temperature Calculation
+                                    val dT = D2 - ms8607C[5] * 256
+                                    val tempCenti = 2000 + (dT * ms8607C[6]) / 8388608
+                                    temperature = tempCenti.toFloat() / 100.0f
+
+                                    // 2. Pressure Calculation
+                                    var OFF = ms8607C[2] * 131072 + (ms8607C[4] * dT) / 64
+                                    var SENS = ms8607C[1] * 65536 + (ms8607C[3] * dT) / 128
+
+                                    // Second order compensation
+                                    if (tempCenti < 2000) {
+                                        val OFF2 = 61 * (tempCenti - 2000) * (tempCenti - 2000) / 16
+                                        val SENS2 = 29 * (tempCenti - 2000) * (tempCenti - 2000) / 16
+                                        OFF -= OFF2
+                                        SENS -= SENS2
+                                    }
+
+                                    val pCenti = ((D1 * SENS) / 2097152 - OFF) / 32768
+                                    pressure = pCenti.toFloat() / 100.0f
+
+                                    // 3. Altitude Calculation
+                                    altitude = 44330f * (1f - (pressure / 1013.25f).pow(1f / 5.255f))
+                                }
+
+                                // --- Humidity (Address 0x40) ---
+                                writeI2C(connection, epOut, 0x40, byteArrayOf(0xF5.toByte())) // No hold
+                                delay(30)
+                                val d3Data = readI2C(connection, epIn, epOut, 0x40, 3)
+                                if (d3Data != null) {
+                                    val D3 = ((d3Data[0].toInt() and 0xFF) shl 8) or (d3Data[1].toInt() and 0xFF)
+                                    humidity = -6.0f + 125.0f * (D3.toFloat() / 65536.0f)
+                                }
+
+                            } catch (e: Exception) {
+                                Log.e("FT260", "Read error", e)
+                            }
+                            delay(1000)
+                        }
+                    }
+
+                    connection.releaseInterface(iface)
+                    connection.close()
+                }
+            }
+        }
+    }
+
     Surface(
         color = forestGreen,
         modifier = modifier.fillMaxSize()
@@ -142,12 +264,6 @@ fun BoxGrid(modifier: Modifier = Modifier) {
         ) {
             val status = if (isConnected) "Connected" else "Disconnected"
             
-            val altitude = 0.0f
-            val temperature = 0.0f
-            val humidity = 0.0f
-            val pressure = 0.0f
-            val airQuality = 0
-
             // 1. Status Box
             SensorTemplateBox {
                 Row(
@@ -164,10 +280,10 @@ fun BoxGrid(modifier: Modifier = Modifier) {
             }
 
             // 2-6. Sensor Boxes
-            SensorTemplateBox { SensorText("Calc Altitude = $altitude m") }
-            SensorTemplateBox { SensorText("Temperature = $temperature \u00B0C") }
-            SensorTemplateBox { SensorText("Humidity = $humidity %") }
-            SensorTemplateBox { SensorText("Pressure = $pressure mbar") }
+            SensorTemplateBox { SensorText("Calc Altitude = ${String.format(Locale.US, "%.1f", altitude)} m") }
+            SensorTemplateBox { SensorText("Temperature = ${String.format(Locale.US, "%.2f", temperature)} \u00B0C") }
+            SensorTemplateBox { SensorText("Humidity = ${String.format(Locale.US, "%.1f", humidity)} %") }
+            SensorTemplateBox { SensorText("Pressure = ${String.format(Locale.US, "%.2f", pressure)} mbar") }
             SensorTemplateBox { SensorText("Air Quality (VOC) = $airQuality") }
 
             // 7. I2C Speed Box
@@ -242,6 +358,36 @@ private fun getI2cSpeed(context: Context): String {
         Log.e("FT260", "Unexpected report: res=$result, id=${report[0].toInt() and 0xFF}")
         "-1"
     }
+}
+
+private fun writeI2C(connection: UsbDeviceConnection, endpoint: UsbEndpoint, address: Int, data: ByteArray): Boolean {
+    val len = data.size.coerceAtMost(60)
+    val reportId = (0xD0 + (len - 1) / 4).toByte()
+    val report = ByteArray(64)
+    report[0] = reportId
+    report[1] = address.toByte()
+    report[2] = 0x06 // START_STOP
+    report[3] = len.toByte()
+    System.arraycopy(data, 0, report, 4, len)
+    return connection.bulkTransfer(endpoint, report, 64, 1000) >= 0
+}
+
+private fun readI2C(connection: UsbDeviceConnection, epIn: UsbEndpoint, epOut: UsbEndpoint, address: Int, length: Int): ByteArray? {
+    val req = ByteArray(64)
+    req[0] = 0xC2.toByte()
+    req[1] = address.toByte()
+    req[2] = 0x06 // START_STOP
+    req[3] = (length and 0xFF).toByte()
+    req[4] = ((length shr 8) and 0xFF).toByte()
+    connection.bulkTransfer(epOut, req, 64, 1000)
+
+    val res = ByteArray(64)
+    val received = connection.bulkTransfer(epIn, res, 64, 1000)
+    if (received > 0 && (res[0].toInt() and 0xFF) >= 0xD0) {
+        val dataLen = res[1].toInt() and 0xFF
+        return res.copyOfRange(2, 2 + dataLen)
+    }
+    return null
 }
 
 @Preview(showBackground = true)
