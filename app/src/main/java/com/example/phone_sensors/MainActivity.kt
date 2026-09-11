@@ -141,12 +141,24 @@ fun BoxGrid(modifier: Modifier = Modifier) {
     var humidity by remember { mutableStateOf(0.0f) }
     var pressure by remember { mutableStateOf(0.0f) }
     var airQuality by remember { mutableStateOf(0) }
+    var vocIndex by remember { mutableStateOf(0) }
 
     val ms8607C = remember { LongArray(7) }
     var isCalibrated by remember { mutableStateOf(false) }
+    val gasAlgo = remember { GasIndexAlgorithm() }
 
     LaunchedEffect(isConnected) {
         if (isConnected && usbManager != null) {
+            // Reset calibration and algorithm states for the new board
+            isCalibrated = false
+            gasAlgo.reset()
+            altitude = 0.0f
+            temperature = 0.0f
+            humidity = 0.0f
+            pressure = 0.0f
+            airQuality = 0
+            vocIndex = 0
+            
             val devices = usbManager.deviceList.values
             val ft260 = devices.find { it.productName?.contains("FT260", ignoreCase = true) == true }
             ft260?.let { device ->
@@ -229,14 +241,40 @@ fun BoxGrid(modifier: Modifier = Modifier) {
                                     altitude = 44330f * (1f - (pressure / 1013.25f).pow(1f / 5.255f))
                                 }
 
-                                // --- Humidity (Address 0x40) ---
-                                writeI2C(connection, epOut, 0x40, byteArrayOf(0xF5.toByte())) // No hold
-                                delay(30)
-                                val d3Data = readI2C(connection, epIn, epOut, 0x40, 3)
-                                if (d3Data != null) {
-                                    val D3 = ((d3Data[0].toInt() and 0xFF) shl 8) or (d3Data[1].toInt() and 0xFF)
-                                    humidity = -6.0f + 125.0f * (D3.toFloat() / 65536.0f)
+                            // --- Humidity (Address 0x40) ---
+                            writeI2C(connection, epOut, 0x40, byteArrayOf(0xF5.toByte())) // No hold
+                            delay(30)
+                            val d3Data = readI2C(connection, epIn, epOut, 0x40, 3)
+                            if (d3Data != null) {
+                                val D3 = ((d3Data[0].toInt() and 0xFF) shl 8) or (d3Data[1].toInt() and 0xFF)
+                                humidity = -6.0f + 125.0f * (D3.toFloat() / 65536.0f)
+                            }
+
+                            // --- Air Quality SGP40 (Address 0x59) ---
+                            val humTicks = (humidity * 65535 / 100).toInt().coerceIn(0, 65535)
+                            val tempTicks = ((temperature + 45) * 65535 / 175).toInt().coerceIn(0, 65535)
+                            
+                            val sgpCmd = ByteArray(8)
+                            sgpCmd[0] = 0x26.toByte()
+                            sgpCmd[1] = 0x0F.toByte()
+                            sgpCmd[2] = (humTicks shr 8).toByte()
+                            sgpCmd[3] = (humTicks and 0xFF).toByte()
+                            sgpCmd[4] = calculateCrc8(sgpCmd[2], sgpCmd[3])
+                            sgpCmd[5] = (tempTicks shr 8).toByte()
+                            sgpCmd[6] = (tempTicks and 0xFF).toByte()
+                            sgpCmd[7] = calculateCrc8(sgpCmd[5], sgpCmd[6])
+
+                            writeI2C(connection, epOut, 0x59, sgpCmd)
+                            delay(30)
+                            val sgpData = readI2C(connection, epIn, epOut, 0x59, 3)
+                            if (sgpData != null) {
+                                // Check CRC of returned raw signal
+                                if (calculateCrc8(sgpData[0], sgpData[1]) == sgpData[2]) {
+                                    val rawVoc = ((sgpData[0].toInt() and 0xFF) shl 8) or (sgpData[1].toInt() and 0xFF)
+                                    airQuality = rawVoc
+                                    vocIndex = gasAlgo.process(rawVoc)
                                 }
+                            }
 
                             } catch (e: Exception) {
                                 Log.e("FT260", "Read error", e)
@@ -284,7 +322,7 @@ fun BoxGrid(modifier: Modifier = Modifier) {
             SensorTemplateBox { SensorText("Temperature = ${String.format(Locale.US, "%.2f", temperature)} \u00B0C") }
             SensorTemplateBox { SensorText("Humidity = ${String.format(Locale.US, "%.1f", humidity)} %") }
             SensorTemplateBox { SensorText("Pressure = ${String.format(Locale.US, "%.2f", pressure)} mbar") }
-            SensorTemplateBox { SensorText("Air Quality (VOC) = $airQuality") }
+            SensorTemplateBox { SensorText("VOC Index = $vocIndex ($airQuality)") }
 
             // 7. I2C Speed Box
             SensorTemplateBox {
@@ -388,6 +426,22 @@ private fun readI2C(connection: UsbDeviceConnection, epIn: UsbEndpoint, epOut: U
         return res.copyOfRange(2, 2 + dataLen)
     }
     return null
+}
+
+private fun calculateCrc8(b1: Byte, b2: Byte): Byte {
+    var crc = 0xFF
+    val data = byteArrayOf(b1, b2)
+    for (i in 0..1) {
+        crc = crc xor (data[i].toInt() and 0xFF)
+        repeat(8) {
+            if (crc and 0x80 != 0) {
+                crc = (crc shl 1) xor 0x31
+            } else {
+                crc = crc shl 1
+            }
+        }
+    }
+    return (crc and 0xFF).toByte()
 }
 
 @Preview(showBackground = true)
